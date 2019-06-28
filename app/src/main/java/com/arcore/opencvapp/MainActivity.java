@@ -4,6 +4,7 @@ import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
+import android.os.Handler;
 import android.support.annotation.NonNull;
 import android.support.v4.app.ActivityCompat;
 import android.support.v4.content.ContextCompat;
@@ -15,38 +16,51 @@ import android.widget.Toast;
 
 import org.opencv.android.BaseLoaderCallback;
 import org.opencv.android.CameraBridgeViewBase;
+import org.opencv.android.JavaCameraView;
 import org.opencv.android.LoaderCallbackInterface;
 import org.opencv.android.OpenCVLoader;
+import org.opencv.core.Core;
+import org.opencv.core.CvType;
 import org.opencv.core.Mat;
+import org.opencv.core.MatOfFloat;
+import org.opencv.core.MatOfInt;
+import org.opencv.core.MatOfPoint;
+import org.opencv.core.MatOfPoint2f;
 import org.opencv.core.MatOfRect;
+import org.opencv.core.Point;
 import org.opencv.core.Rect;
+import org.opencv.core.RotatedRect;
 import org.opencv.core.Scalar;
 import org.opencv.core.Size;
+import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.Imgproc;
 import org.opencv.objdetect.CascadeClassifier;
+import org.opencv.utils.Converters;
+import org.opencv.video.BackgroundSubtractor;
+import org.opencv.video.Video;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
 
 public class MainActivity extends AppCompatActivity implements CameraBridgeViewBase.CvCameraViewListener2 {
     private String TAG = "OpenCVApp";
 
     private CameraBridgeViewBase cameraBViewB;
 
-    private static final Scalar    FACE_RECT_COLOR     = new Scalar(0, 255, 0, 255);
+    private CascadeClassifier cascadeClassifier;
+    private Mat grayscaleImage;
+    private int absoluteFaceSize;
 
-    private Mat                    mRgba;
-    private Mat                    mGray;
-    private File                   mCascadeFile;
-    private CascadeClassifier      mJavaDetector;
-
-    private float                  mRelativeFaceSize   = 0.2f;
-    private int                    mAbsoluteFaceSize   = 0;
-
-
+    public Mat accumulatedBackground;
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -62,6 +76,7 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
     private void initCamera() {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
+        cameraBViewB = new JavaCameraView(this, -1);
         cameraBViewB = findViewById(R.id.ivCamera);
 
         cameraBViewB.setCvCameraViewListener(this);
@@ -72,14 +87,14 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         public void onManagerConnected(int status) {
             if (status == LoaderCallbackInterface.SUCCESS) {
                 Toast.makeText(getBaseContext(), "OpenCV loaded successfully", Toast.LENGTH_SHORT).show();
-
-                System.loadLibrary("detection_based_tracker");
+                initOpenCVVariables();
+                System.loadLibrary("opencv_java4");
 
                 try {
                     // load cascade file from application resources
-                    InputStream is = getResources().openRawResource(R.raw.lbpcascade_frontalface);
+                    InputStream is = getResources().openRawResource(R.raw.haarcascade_fullbody);
                     File cascadeDir = getDir("cascade", Context.MODE_PRIVATE);
-                    mCascadeFile = new File(cascadeDir, "lbpcascade_frontalface.xml");
+                    File mCascadeFile = new File(cascadeDir, "haarcascade_fullbody.xml");
                     FileOutputStream os = new FileOutputStream(mCascadeFile);
 
                     byte[] buffer = new byte[4096];
@@ -90,15 +105,12 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
                     is.close();
                     os.close();
 
-                    mJavaDetector = new CascadeClassifier(mCascadeFile.getAbsolutePath());
-                    if (mJavaDetector.empty()) {
-                        mJavaDetector = null;
-                    }
+                    cascadeClassifier = new CascadeClassifier(mCascadeFile.getAbsolutePath());
 
-                    cascadeDir.delete();
+//                    cascadeDir.delete();
 
                 } catch (IOException e) {
-                    e.printStackTrace();
+                    Toast.makeText(getBaseContext(), "ERROR!", Toast.LENGTH_SHORT).show();
                 }
 
                 cameraBViewB.enableView();
@@ -107,6 +119,10 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
             }
         }
     };
+
+    private void initOpenCVVariables(){
+        accumulatedBackground = new Mat();
+    }
 
     @Override
     public void onResume() {
@@ -123,41 +139,113 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
 
     @Override
     public void onCameraViewStarted(int width, int height) {
-        mGray = new Mat();
-        mRgba = new Mat();
+        grayscaleImage = new Mat(height, width, CvType.CV_8UC4);
+        absoluteFaceSize = (int) (height * 0.2);
     }
 
     @Override
     public void onCameraViewStopped() {
-        mGray.release();
-        mRgba.release();
     }
+
+
 
     @Override
     public Mat onCameraFrame(CameraBridgeViewBase.CvCameraViewFrame inputFrame) {
-
-        mRgba = inputFrame.rgba();
-        mGray = inputFrame.gray();
-
-        if (mAbsoluteFaceSize == 0) {
-            int height = mGray.rows();
-            if (Math.round(height * mRelativeFaceSize) > 0) {
-                mAbsoluteFaceSize = Math.round(height * mRelativeFaceSize);
-            }
-
-        }
-
+        Mat inputMat = inputFrame.rgba();
+        Mat grayImage = inputFrame.gray();
+        /*
+                                        Выделение области стоящего человека зелёным прямоугольником
+        Imgproc.cvtColor(inputMat, grayscaleImage, Imgproc.COLOR_RGBA2RGB);
         MatOfRect faces = new MatOfRect();
-
-         if (mJavaDetector != null)
-             mJavaDetector.detectMultiScale(mGray, faces, 1.1, 2, 2, // TODO: objdetect.CV_HAAR_SCALE_IMAGE
-                        new Size(mAbsoluteFaceSize, mAbsoluteFaceSize), new Size());
-
+        if (cascadeClassifier != null) {
+            cascadeClassifier.detectMultiScale(grayscaleImage, faces, 1.1, 2, 2,
+                    new Size(absoluteFaceSize, absoluteFaceSize), new Size());
+        }
         Rect[] facesArray = faces.toArray();
-        for (int i = 0; i < facesArray.length; i++)
-            Imgproc.rectangle(mRgba, facesArray[i].tl(), facesArray[i].br(), FACE_RECT_COLOR, 3);
+        for (int i = 0; i <facesArray.length; i++)
+            Imgproc.rectangle(inputMat, facesArray[i].tl(), facesArray[i].br(), new Scalar(0, 255, 0, 255), 3);*/
 
-        return mRgba;
+//        inputMat = doCanny(inputMat, grayImage);
+//        return convert(inputMat);
+        return process(inputMat);
+    }
+
+
+    private Mat doCanny(Mat frame, Mat grayImage){
+        Mat detectedEdges = new Mat();
+        Imgproc.cvtColor(frame, grayImage, Imgproc.COLOR_BGR2GRAY);
+        Imgproc.blur(grayImage, detectedEdges, new Size(15, 15));
+        int threshold = 10;
+        Imgproc.Canny(detectedEdges, detectedEdges, threshold, threshold * 3, 3, false);
+/*
+        Mat dest = new Mat();
+        Core.add(dest, Scalar.all(0), dest);
+        frame.copyTo(dest, detectedEdges);*/
+
+        return detectedEdges;
+    }
+    
+    public static Mat convert(Mat mat){
+        Scalar white = new Scalar(255, 255, 255);
+        List<MatOfPoint> contours = new ArrayList<>();
+        Mat dest = Mat.zeros(mat.size(), CvType.CV_8UC3);
+        Imgproc.findContours(mat, contours, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+        Imgproc.drawContours(dest, contours, -1, white);
+
+        return dest;
+    }
+
+    /**
+     * @param inputImage
+     * threshold - коэффициент double; Чем выше число, тем выше контраст ч/б
+     * learningRate - коэффициент double
+     * @return
+     */
+    private double learningRate = 0.9;
+    private double threshold = 30;
+    private int frameCounter = 0;
+
+    private  Mat process(Mat inputImage){
+        Mat foregroundThresh = new Mat();
+        Mat inputGray = new Mat();
+        Mat backImage = new Mat();
+        Mat foreground = new Mat();
+        Mat inputFloating = new Mat();
+
+        Imgproc.cvtColor(inputImage, inputGray, Imgproc.COLOR_BGR2GRAY);
+        if(accumulatedBackground.empty()) {
+            inputGray.convertTo(accumulatedBackground, CvType.CV_32F);
+        }
+        accumulatedBackground.convertTo(backImage, CvType.CV_8U);
+        Core.absdiff(backImage, inputGray, foreground);
+        Imgproc.threshold(foreground, foregroundThresh, threshold, 255, Imgproc.THRESH_BINARY_INV);
+        inputGray.convertTo(inputFloating, CvType.CV_32F);
+        Imgproc.accumulateWeighted(inputFloating, accumulatedBackground, learningRate, foregroundThresh);
+        if(frameCounter == 1) {
+            inputGray.convertTo(accumulatedBackground, CvType.CV_32F);
+            frameCounter = 0;
+        } else {
+            frameCounter++;
+        }
+        return negative(foregroundThresh);
+    }
+
+    private Mat negative(Mat foregroundThresh){
+        Mat result = new Mat();
+        Mat white = foregroundThresh.clone();
+        white.setTo(new Scalar(255.0));
+        Core.subtract(white, foregroundThresh, result);
+        return fastDenoising(result);
+    }
+
+    public Mat fastDenoising(Mat image) {
+        Mat result = new Mat();
+        Mat tmp = new Mat();
+
+        Mat kernel = new Mat(new Size(3, 3), CvType.CV_8UC1, new Scalar(255));
+        Imgproc.morphologyEx(image, tmp, Imgproc.MORPH_OPEN,kernel);
+        Imgproc.morphologyEx(tmp, result, Imgproc.MORPH_CLOSE,kernel);
+        return result;
     }
 
     private void askPermissions() {
@@ -197,8 +285,3 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
     }
 
 }
-
-
-
-
-
